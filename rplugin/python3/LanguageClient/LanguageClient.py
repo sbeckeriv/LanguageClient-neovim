@@ -1,6 +1,7 @@
 import neovim
 import os
 import subprocess
+import inspect
 import json
 import threading
 from functools import partial
@@ -13,6 +14,19 @@ from . logger import logger
 from . RPC import RPC
 from . TextDocumentItem import TextDocumentItem
 from . DiagnosticsDisplay import DiagnosticsDisplay
+
+
+def rpcDecorator(warn=True):
+    def wrapper(f):
+        def wrapped(*args):
+            client = args[0]
+            if not client.alive():
+                return
+            keys = inspect.getfullargspec(f).args
+            args = client.getArgs(args, keys)
+            f(*args)
+        return wrapped
+    return wrapper
 
 
 @neovim.plugin
@@ -55,37 +69,40 @@ class LanguageClient:
 
         self.asyncEcho(msg)
 
-    def getArgs(self, argsL: List, keys: List) -> List:
-        if len(argsL) == 0:
-            args = {}  # type: Dict[str, Any]
-        else:
-            args = argsL[0]
+    def getArgs(self, args: List, keys: List) -> List:
+        argsFilled = [None] * len(keys)
+        for i in range(len(keys)):
+            v = None
+            if i < len(args):
+                v = args[i]
+            if v:
+                argsFilled[i] = v
+                continue
 
-        cursor = []  # type: List[int]
-
-        res = []
-        for k in keys:
+            k = keys[i]
             if k == "uri":
-                v = args.get("uri") or pathToURI(self.nvim.current.buffer.name)
+                v = pathToURI(self.nvim.current.buffer.name)
+            elif k == "rootPath":
+                v = getRootPath(self.nvim.current.buffer.name,
+                                 self.nvim.current.buffer.options["filetype"])
             elif k == "languageId":
-                v = (args.get("languageId") or
-                     self.nvim.current.buffer.options['filetype'])
+                v = self.nvim.current.buffer.options['filetype']
             elif k == "line":
-                v = args.get("line")
-                if not v:
-                    cursor = self.nvim.current.window.cursor
-                    v = cursor[0] - 1
+                cursor = self.nvim.current.window.cursor
+                v = cursor[0] - 1
             elif k == "character":
-                v = args.get("character") or cursor[1]
+                v = cursor[1]
             elif k == "cword":
-                v = args.get("cword") or self.nvim.call("expand", "<cword>")
+                v = self.nvim.call("expand", "<cword>")
             elif k == "bufnames":
-                v = args.get("bufnames") or [b.name for b in self.nvim.buffers]
+                v = [b.name for b in self.nvim.buffers]
             else:
-                v = args.get(k)
-            res.append(v)
+                msg = "Unknown argument: " + k
+                logger.error(msg)
+                self.asyncEcho(msg)
+            argsFilled[i] = v
 
-        return res
+        return argsFilled
 
     def applyChanges(
             self, changes: Dict,
@@ -181,24 +198,19 @@ class LanguageClient:
 
         logger.info('End LanguageClientStart')
 
-        self.initialize([])
+        self.initialize()
         self.textDocument_didOpen()
 
-    @neovim.function('LanguageClient_initialize')
-    def initialize(self, args: List) -> None:
+    @neovim.function("LanguageClient_initialize")
+    @rpcDecorator()
+    def initialize(self, rootPath: str) -> None:
         # {rootPath?: str, cb?}
         if not self.alive():
             return
 
         logger.info('Begin initialize')
 
-        rootPath, languageId, cb = self.getArgs(
-                args, ["rootPath", "languageId", "cb"])
-        if rootPath is None:
-            rootPath = getRootPath(self.nvim.current.buffer.name, languageId)
-            self.rootUri = pathToURI(rootPath)
-        if cb is None:
-            cb = self.handleInitializeResponse
+        self.rootUri = pathToURI(rootPath)
 
         self.rpc.call('initialize', {
             "processId": os.getpid(),
@@ -206,13 +218,13 @@ class LanguageClient:
             "rootUri": self.rootUri,
             "capabilities": {},
             "trace": "verbose"
-            }, cb)
+            })
 
     def handleInitializeResponse(self, result: Dict) -> None:
         self.capabilities = result['capabilities']
         logger.info('End initialize')
 
-    @neovim.autocmd('BufReadPost', pattern="*")
+    # @neovim.autocmd('BufReadPost', pattern="*")
     def textDocument_didOpen(self) -> None:
         if not self.alive(warn=False):
             return
@@ -529,11 +541,11 @@ call fzf#run(fzf#wrap({{
         cmd += "| normal! {}G{}|".format(line, character)
         self.asyncCommand(cmd)
 
-    @neovim.autocmd("TextChanged", pattern="*")
+    # @neovim.autocmd("TextChanged", pattern="*")
     def textDocument_autocmdTextChanged(self):
         self.textDocument_didChange()
 
-    @neovim.autocmd("TextChangedI", pattern="*")
+    # @neovim.autocmd("TextChangedI", pattern="*")
     def textDocument_autocmdTextChangedI(self):
         self.textDocument_didChange()
 
@@ -558,7 +570,7 @@ call fzf#run(fzf#wrap({{
             "contentChanges": changes
             })
 
-    @neovim.autocmd("BufWritePost", pattern="*")
+    # @neovim.autocmd("BufWritePost", pattern="*")
     def textDocument_didSave(self) -> None:
         if not self.alive(warn=False):
             return
@@ -642,7 +654,7 @@ call fzf#run(fzf#wrap({{
                               " name=LanguageClient{} buffer={}".format(
                                 self.signid, line + 1, name, buf.number))
 
-    @neovim.autocmd("CursorMoved", pattern="*")
+    # @neovim.autocmd("CursorMoved", pattern="*")
     def showDiagnosticMessage(self) -> None:
         uri, line = self.getArgs([], ["uri", "line"])
         if not uri or line == self.lastLine:
